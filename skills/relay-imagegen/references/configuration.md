@@ -118,7 +118,7 @@ python3 ~/.agents/skills/relay-imagegen/scripts/relay_imagegen.py generate \
 
 进度输出到 stderr，最终 JSON 输出到 stdout。每次运行另外保存 `run-*.json`，内容包括提示词、参数、各请求状态、原始图片路径、实际尺寸和错误；记录接口地址以区分 Responses 会话来源，但不记录 Key 或 Authorization。提示词仍属于本地数据，分享结果清单前应自行确认内容适合分享。
 
-保存两张及以上图片时，生成 `gallery-*.html` 编号预览页，可在本机浏览器中打开；原图仍是各自独立的文件。原图尺寸与 `--size` 不一致时返回警告，不悄悄缩放。清单中 `saved_count` 表示保存数，`requested_count` 表示请求数；图片可解码与否仍需查看工具验证。
+保存两张及以上图片时，生成 `gallery-*.html` 编号预览页，可在本机浏览器中打开；原图仍是各自独立的文件。原图尺寸与 `--size` 不一致时返回警告，不悄悄缩放。清单中 `saved_count` 表示保存数，`requested_count` 表示请求数；保存数不代表已完整解码或通过视觉检查；验图遵循 [SKILL.md 的交付规则](../SKILL.md#在对话中交付)，批量默认不加载图片到对话。
 
 任一请求失败后停止发送剩余请求，保留已完成文件，返回非零退出码及 `unsubmitted_requests`。不自动重试、不自动补足张数、不自动切换单次/多次模式。每个请求最多只提交一次；如需重新执行，应先看清单判断已完成与未提交部分，避免整批重复。
 

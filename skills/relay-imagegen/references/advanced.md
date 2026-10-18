@@ -12,7 +12,7 @@ python3 <skill-dir>/scripts/relay_imagegen.py edit \
   --session /absolute/path/project/session.json
 ```
 
-蒙版必须是可完整解码的 PNG，包含透明通道，与第一张参考图像素尺寸相同，且至少有一个非完全不透明像素。透明区域表示允许修改；不透明区域表示希望保留。程序在提交前校验，不改变原图。蒙版约束不能保证模型完全不改动其他区域，仍需视觉验收。蒙版功能依赖 Pillow。
+蒙版必须是可完整解码的 PNG，包含透明通道，与第一张参考图像素尺寸相同，且至少有一个非完全不透明像素。透明区域表示允许修改；不透明区域表示希望保留。程序在提交前校验，不改变原图。蒙版约束不能保证模型完全不改动其他区域，只有视觉检查后才能确认保留效果，检查方式遵循 [SKILL.md 的交付规则](../SKILL.md#在对话中交付)。蒙版功能依赖 Pillow。
 
 默认 multipart 使用 `mask` 文件字段。显式 `--edit-transport json` 时发送 `mask.image_url` Data URL；只有中转站声明支持该 JSON 协议时才使用。
 
