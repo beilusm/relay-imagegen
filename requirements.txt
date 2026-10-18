@@ -1,0 +1,2 @@
+# Optional for API calls; required for masks, covers and the local studio.
+Pillow

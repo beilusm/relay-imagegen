@@ -1,0 +1,36 @@
+# Local outputs, generated packages and work files
+/output/
+/dist/
+/tmp/
+/relay-imagegen.zip
+*.log
+
+# Credentials and machine-local configuration
+.env
+.env.*
+!.env.example
+relay-imagegen.json
+relay-imagegen.local.json
+*.local.json
+auth.json
+*.pem
+*.key
+/.codex/
+/.agents/
+/.aws/
+
+# Python environments and caches
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

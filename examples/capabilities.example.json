@@ -1,0 +1,4 @@
+{
+  "backends": ["images"],
+  "max_n": 1
+}
