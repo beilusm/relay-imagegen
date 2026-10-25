@@ -1,6 +1,6 @@
-# 局部编辑、版本、模型能力与可选后端
+# GPT Image 编辑、参数与版本
 
-这些功能仍使用用户指定的中转站。模型能力声明与离线测试不证明远端支持；不要通过付费请求试探参数，也不要在失败后自动切换后端或补发。
+这些功能仍使用用户指定的中转站 GPT Image Images API。模型能力声明与离线测试不证明远端支持；不要通过付费请求试探参数，也不要在失败后自动切换协议或补发。
 
 ## 蒙版局部编辑
 
@@ -14,7 +14,7 @@ python3 <skill-dir>/scripts/relay_imagegen.py edit \
 
 蒙版必须是可完整解码的 PNG，包含透明通道，与第一张参考图像素尺寸相同，且至少有一个非完全不透明像素。透明区域表示允许修改；不透明区域表示希望保留。程序在提交前校验，不改变原图。蒙版约束不能保证模型完全不改动其他区域，只有视觉检查后才能确认保留效果，检查方式遵循 [SKILL.md 的交付规则](../SKILL.md#在对话中交付)。蒙版功能依赖 Pillow。
 
-默认 multipart 使用 `mask` 文件字段。显式 `--edit-transport json` 时发送 `mask.image_url` Data URL；只有中转站声明支持该 JSON 协议时才使用。
+本地素材默认 multipart，使用 `mask` 文件字段。JSON 编辑支持 `mask.image_url`（URL/Data URL）或 `mask.file_id`；不能同时设置。
 
 ## 本地版本会话
 
@@ -81,16 +81,22 @@ python3 <skill-dir>/scripts/relay_imagegen.py capabilities show --model '实际�
 python3 <skill-dir>/scripts/relay_imagegen.py capabilities set --model '实际模型ID' --file /path/capabilities.json
 ```
 
-也可在 generate/edit 传 `--capabilities /path/capabilities.json` 临时覆盖。缺省字段表示未知；布尔 false、空枚举数组表示不支持。声明与请求冲突时在联网前拒绝。`max_n` 限制每次请求的图片数；用户显式选择 separate 时允许拆成单图请求。`max_reference_images` 限制参考图数量。
+也可在 generate/edit 传 `--capabilities /path/capabilities.json` 临时覆盖。缺省字段表示未知；布尔 false、空枚举数组表示不支持。声明与请求冲突时默认记录警告，仍按用户参数提交，交给服务端判断。只有用户明确要求能力表作为硬性限制时，添加 `--strict-capabilities` 才会在联网前拒绝。`max_n` 记录每次请求的图片数上限（仅严格模式拦截）；用户显式选择 separate 时允许拆成单图请求。`max_reference_images` 记录参考图数量上限（仅严格模式拦截）。能力表不会覆盖官方 API 自身边界：每请求最多 10 张输出、16 张参考图。
 
-能力声明随配置保存，只有 `config status` 安全查看配置状态；不要打印包含 Key 的配置文件。`/models` 返回的名字不构成能力验证。
+旧能力表可能过时，不能据此认定新模型没有能力，也不能据此改写提示词或更换参数。能力声明随配置保存，只有 `config status` 安全查看配置状态；不要打印包含 Key 的配置文件。`/models` 返回的名字不构成能力验证。
 
 ## 额外参数和用量
+
+`--api-params-file /path/params.json` 将服务商新增参数的 JSON 对象原样加入 Images 请求。嵌套对象/数组在 multipart 中按 JSON 编码。不接受覆盖 model、prompt、n、参考图、蒙版或已有标准选项；标准选项直接用 CLI 设置。插件不会根据固定参数白名单删除未知字段。不要将凭据放入此文件，参数会记录在运行清单。
+
+尺寸、质量、背景、输入保真和审核等值默认不发送，也不靠固定枚举限制服务商新增取值；能否使用由所选接口判断。保存器目前识别 PNG/JPEG/WebP，这属于本地解码能力，不代表模型仅支持这些格式。
+
+本地内存保护默认单张 32 MiB、参考图总计 64 MiB、单个 JSON 响应/流式事件 128 MiB。需要更大输入/输出时设置正数环境变量 `RELAY_IMAGE_MAX_IMAGE_MIB`、`RELAY_IMAGE_MAX_REFERENCE_MIB`、`RELAY_IMAGE_MAX_RESPONSE_MIB`；流式总量保护为响应值的四倍。这些值是可调整的资源保护，不是模型能力限制，不会自动压缩、裁切或缩小图片。
 
 - `--output-format jpeg|webp --output-compression 0..100`：原样传递压缩参数，仅在显式 JPEG/WebP 时接受。
 - `--input-fidelity low|high`：只给支持调节该参数的模型使用；默认不发送。有些模型固定高保真，不能发送此参数。
 - `--moderation auto|low`：原样传递服务端支持的审核等级，不保证特定内容获准生成。
-- `usage`、流式 `event_usage`、`revised_prompt`、Responses ID（接口提供时）保存到运行清单。接口未提供时不估算 token 或金额，不把多个不同口径的用量强行相加。
+- `usage`、流式 `event_usage`、响应元数据和 `revised_prompt`（接口提供时）保存到运行清单。接口未提供时不估算 token 或金额。
 - 返回元数据中的配置 Key 会脱敏。原始服务端错误内容不会直接打印。
 
 ## 流式预览
@@ -104,23 +110,26 @@ python3 <skill-dir>/scripts/relay_imagegen.py generate \
 
 最终结果才进入 `files`。收到预览不代表成功。断流时保留预览与已收到的最终图片，停止剩余批次，不重试。不会将普通 JSON 响应静默当作流式结果，也不会失败后再发非流式请求。
 
-## 显式 Responses 后端
+## 官方 GPT Image 参数
 
-先确认中转站支持 Responses 图像工具，以及主模型与图片模型组合。它们是两个不同模型参数，程序不替用户选择：
+`generate` 和 `edit` 直接对应官方 Images API。支持 `model`、`prompt`、`background`、`moderation`、`n`、`output_compression`、`output_format`、`partial_images`、`quality`、`safety_identifier`、`size`、`stream`，并兼容已弃用的 `user`。编辑另支持 `images`、`mask` 和 `input_fidelity`。GPT Image 不使用旧式 `style` / `response_format`，风格写在用户提示词中，图片默认 Base64 返回。
 
-```bash
-python3 <skill-dir>/scripts/relay_imagegen.py generate \
-  --backend responses \
-  --responses-model '中转站支持的主模型ID' \
-  --model '中转站支持的图片模型ID' \
-  --prompt-file /path/prompt.txt \
-  --session /path/session.json
+## URL、Data URL 与文件 ID
+
+本地图默认 multipart。使用 `--image-url https://...`、`--image-file-id file-...`、`--mask-url https://...` 或 `--mask-file-id file-...` 时自动选择官方 JSON 编辑请求，不下载/重绘素材，不在请求失败后切换协议。Files API ID 必须来自当前服务商已有的上传，本插件不实现通用文件管理。
+
+`--images-file /path/images.json` 按数组原顺序提交引用，例如：
+
+```json
+[{"image_url":"https://example.com/reference.png"},{"file_id":"file-existing-image"}]
 ```
 
-- `--model` 发给 `tools[].model`，`--responses-model` 发给顶层 `model`。
-- 支持参考图、蒙版、流式预览及工具返回图片保存。Images API 的 `response-format` 不用于这个后端。
-- 多图用 `--n N --request-mode separate`，或 `--prompts-file`；每次工具请求一张，不承诺服务端严格只返回一张。数量不符会报告，不补发。
-- 默认 `store=false`。需要服务端会话留存时，显式加 `--responses-store`；可传 `--previous-response-id` 继续服务端上下文。
-- 同一 session、相同 endpoint 和主模型，且父请求曾启用 store 时，启用 store 的后续编辑会复用选中父图对应的 response ID；同时上传选中图片。否则使用本地图像重新建立上下文。
-- 不向新的主机迁移 response ID，不自动变更 API 协议、主模型或图片模型。
-- 服务商未开放 Responses 时，现有 Images API 仍可用本地选图实现连续编辑。
+需要精确混合顺序时使用此数组；单独参数组合按本地图、URL、文件 ID、数组顺序组合。每项只能指定 `image_url` 或 `file_id`，不能同时设置。蒙版同样三选一：本地 `--mask`、`--mask-url`、`--mask-file-id`。远端图片无法本地核验尺寸或蒙版透明度时，由 API 校验，不能声称已验证。
+
+## 官方边界与兼容性
+
+截至 2026-10-24，官方接口每次 `n=1..10`、最多 16 张输入图片、提示词最多 32,000 字符，单张 Data URL 最长 20 MiB。总张数超过 10 时自动按 10 张分批，最后一批仅提交剩余数量，失败即停止。资源保护可调整，但不会绕过 API 自身边界。
+
+原生响应中的创建时间、尺寸、格式、质量、背景、安全标识及用量保存到请求的 `response_metadata`；流式事件元数据和预览序号同时保留。实际文件规格与请求不符时发出警告，不本地转换成看似合规的结果。参数已发送并不证明服务端执行了该参数。
+
+官方参考：[生成](https://developers.openai.com/api/reference/resources/images/methods/generate)、[编辑](https://developers.openai.com/api/reference/resources/images/methods/edit)。

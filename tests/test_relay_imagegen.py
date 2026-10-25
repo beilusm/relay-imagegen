@@ -66,6 +66,20 @@ def server(mode="base64"):
             else:
                 body = json.loads(raw)
             calls.append(("POST", self.path, dict(self.headers), body))
+            if mode == "n-one-only" and body["n"] > 1:
+                self.send_response(422)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"detail": [{"loc": ["body", "n"], "type": "less_than_equal",
+                    "msg": "Input should be less than or equal to 1", "input": body,
+                    "ctx": {"private": "sk-local-test-secret"}}]}).encode())
+                return
+            if mode == "structured-error":
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": {"code": "invalid_parameter", "param": "quality",
+                    "type": "invalid_request_error", "message": "Unsupported quality; Bearer sk-local-test-secret"}}).encode())
+                return
             if mode == "cloudflare":
                 self.cloudflare_denial()
                 return
@@ -207,7 +221,7 @@ class RelayTests(unittest.TestCase):
         prompt.write_text("中文\n文字：你好", encoding="utf-8")
         with server() as (base, calls):
             self.configure(base + "/custom/v1")
-            code, result = self.cli("generate", "--prompt-file", str(prompt), "--output-dir", str(self.root / "out"), "--model", "custom-model", "--size", "1024x1024", "--quality", "high", "--output-format", "png", "--background", "transparent", "--response-format", "b64_json")
+            code, result = self.cli("generate", "--prompt-file", str(prompt), "--output-dir", str(self.root / "out"), "--model", "custom-model", "--size", "1024x1024", "--quality", "high", "--output-format", "png", "--background", "transparent")
             self.assertEqual(code, 0)
             self.assertEqual(calls[0][1], "/custom/v1/images/generations")
             self.assertEqual(calls[0][3]["prompt"], "中文\n文字：你好")
@@ -239,6 +253,67 @@ class RelayTests(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertIn("401", result["error"])
             self.assertEqual(len(calls), 1)
+
+    def test_422_reports_validation_field_without_input_or_automatic_fallback(self):
+        with server("n-one-only") as (base, calls):
+            self.configure(base)
+            code, result = self.generate("--n", "10")
+            self.assertEqual(code, 1, result)
+            self.assertIn("422", result["error"])
+            self.assertIn("body.n", result["error"])
+            self.assertIn("less than or equal to 1", result["error"])
+            self.assertNotIn("private", result["error"])
+            self.assertNotIn("input=", result["error"])
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0][3]["n"], 10)
+
+    def test_structured_api_error_is_useful_and_redacted_for_json_and_stream(self):
+        with server("structured-error") as (base, calls):
+            self.configure(base)
+            for options in ((), ("--stream",)):
+                code, result = self.generate(*options)
+                self.assertEqual(code, 1, result)
+                self.assertIn("invalid_parameter", result["error"])
+                self.assertIn("quality", result["error"])
+                self.assertIn("[REDACTED]", result["error"])
+            self.assertEqual(len(calls), 2)
+
+    def test_saved_request_mode_is_scoped_overridable_and_prevents_bulk_retry(self):
+        with server("n-one-only") as (base, calls):
+            self.configure(base)
+            code, setting = self.cli("config", "set-request-mode", "separate")
+            self.assertEqual(code, 0, setting)
+            self.assertEqual(setting["endpoint"], base + "/v1/images/generations")
+            self.assertEqual(setting["model"], "image2.5")
+            code, result = self.generate("--n", "3")
+            self.assertEqual(code, 0, result)
+            self.assertEqual(result["saved_count"], 3)
+            self.assertEqual(result["request_mode"], "separate")
+            self.assertEqual([call[3]["n"] for call in calls], [1, 1, 1])
+            self.assertEqual(self.generate("--n", "2", "--request-mode", "single")[0], 1)
+            self.assertEqual(calls[-1][3]["n"], 2)
+            self.assertEqual(self.generate("--n", "2", "--model", "another-image-model")[0], 1)
+            self.assertEqual(calls[-1][3]["n"], 2)
+            config = json.loads(self.config.read_text())
+            self.assertEqual(relay.configured_request_mode(config, base + "/v1/images/edits", "image2.5"), "single")
+            self.assertEqual(relay.configured_request_mode(config, "https://another.example/v1/images/generations", "image2.5"), "single")
+            code, status = self.cli("config", "status")
+            self.assertEqual(status["generation_request_mode"], "separate")
+            self.assertEqual(status["edit_request_mode"], "single")
+            self.assertEqual(self.cli("config", "set-request-mode", "auto")[0], 0)
+            self.assertNotIn("request_modes", json.loads(self.config.read_text()))
+            self.assertEqual(self.generate("--n", "2")[0], 1)
+            self.assertEqual(len(calls), 6)
+
+    def test_saved_separate_mode_stops_after_first_failure(self):
+        with server("batch-fail-second") as (base, calls):
+            self.configure(base)
+            self.assertEqual(self.cli("config", "set-request-mode", "separate")[0], 0)
+            code, result = self.generate("--n", "4")
+            self.assertEqual(code, 1, result)
+            self.assertEqual(result["saved_count"], 1)
+            self.assertEqual(result["unsubmitted_requests"], 2)
+            self.assertEqual(len(calls), 2)
 
     def test_partial_result_keeps_successful_image(self):
         with server("partial") as (base, calls):
@@ -426,12 +501,71 @@ class RelayTests(unittest.TestCase):
         source = self.root / "prompts.json"
         with server() as (base, calls):
             self.configure(base)
-            for value in (["valid", ""], [], ["a"] * 11, {"prompt": "not an array"}, ["valid", 1]):
+            for value in (["valid", ""], [], {"prompt": "not an array"}, ["valid", 1]):
                 source.write_text(json.dumps(value))
                 self.assertEqual(self.cli("generate", "--prompts-file", str(source), "--output-dir", str(self.root / "out"))[0], 1)
             source.write_text(json.dumps(["one", "two"]))
             self.assertEqual(self.cli("generate", "--prompts-file", str(source), "--n", "2", "--output-dir", str(self.root / "out"))[0], 1)
             self.assertEqual(calls, [])
+
+    def test_official_ten_image_request_cap_is_applied_in_chunks(self):
+        with server("multi") as (base, calls):
+            self.configure(base)
+            code, result = self.generate("--n", "11")
+            self.assertEqual(code, 0, result)
+            self.assertEqual(result["saved_count"], 11)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual([call[3]["n"] for call in calls], [10, 1])
+        prompts = [f"用户提示词 {i}\n" for i in range(11)]
+        source = self.root / "eleven-prompts.json"
+        source.write_text(json.dumps(prompts, ensure_ascii=False))
+        with server() as (base, calls):
+            self.configure(base)
+            code, result = self.cli("generate", "--prompts-file", str(source), "--output-dir", str(self.root / "batch"))
+            self.assertEqual(code, 0, result)
+            self.assertEqual([call[3]["prompt"] for call in calls], prompts)
+
+    def test_gpt_image_prompt_and_reference_limits(self):
+        source = self.root / "prompts.json"
+        with server() as (base, calls):
+            self.configure(base)
+            source.write_text(json.dumps(["x" * 32001]))
+            self.assertEqual(self.cli("generate", "--prompts-file", str(source), "--output-dir", str(self.root / "out"))[0], 1)
+            source.write_text(json.dumps(["x" * 32000]))
+            self.assertEqual(self.cli("generate", "--prompts-file", str(source), "--output-dir", str(self.root / "out"))[0], 0)
+            self.assertEqual(len(calls), 1)
+        reference = self.root / "reference.png"
+        reference.write_bytes(PNG)
+        self.assertEqual(len(relay.load_edit_references(type("Args", (), {
+            "images":[str(reference)] * 16,"image_urls":[],"image_file_ids":[],"images_file":None})())),16)
+        with self.assertRaises(relay.SkillError):
+            relay.load_edit_references(type("Args", (), {
+                "images":[str(reference)] * 17,"image_urls":[],"image_file_ids":[],"images_file":None})())
+
+    def test_local_memory_guards_are_configurable_without_transforming_images(self):
+        reference = self.root / "reference.png"
+        reference.write_bytes(PNG)
+        with patch.object(relay, "MAX_IMAGE_BYTES", len(PNG) - 1), patch.object(relay, "MAX_REFERENCE_BYTES", len(PNG) - 1):
+            with patch.dict(os.environ, {"RELAY_IMAGE_MAX_IMAGE_MIB": "1", "RELAY_IMAGE_MAX_REFERENCE_MIB": "2"}):
+                self.assertEqual(relay.load_reference_images([str(reference)])[0]["data"], PNG)
+                self.assertEqual(relay.image_bytes({"b64_json": ENCODED}, 1)[0], PNG)
+        for value in ("0", "-1", "nan", "inf", "not-a-number"):
+            with patch.dict(os.environ, {"RELAY_IMAGE_MAX_IMAGE_MIB": value}):
+                with self.assertRaises(relay.SkillError):
+                    relay.byte_limit("IMAGE", relay.MAX_IMAGE_BYTES)
+        with server() as (base, calls):
+            self.configure(base)
+            for key in ("RELAY_IMAGE_MAX_IMAGE_MIB", "RELAY_IMAGE_MAX_RESPONSE_MIB"):
+                with patch.dict(self.env, {key: "invalid"}):
+                    code, result = self.generate()
+                    self.assertEqual(code, 1, result)
+            self.assertEqual(calls, [])
+
+    def test_json_reference_data_url_obeys_official_twenty_mib_limit(self):
+        original = PNG + b"\0" * (16 * 1024 * 1024)
+        reference = {"data": original, "mime": "image/png"}
+        with self.assertRaises(relay.SkillError):
+            relay.image_request_payload({"prompt": "原样使用素材"}, [reference], "json")
 
     def test_image_dimensions_match_decoded_files(self):
         try:
@@ -500,8 +634,7 @@ class RelayTests(unittest.TestCase):
     def test_reference_limits_checked_locally(self):
         reference = self.root / "one.png"
         reference.write_bytes(PNG)
-        with self.assertRaises(relay.SkillError):
-            relay.load_reference_images([str(reference)] * 17)
+        self.assertEqual(len(relay.load_reference_images([str(reference)] * 17)), 17)
         with patch.object(relay, "MAX_IMAGE_BYTES", len(PNG) - 1):
             with self.assertRaises(relay.SkillError):
                 relay.load_reference_images([str(reference)])

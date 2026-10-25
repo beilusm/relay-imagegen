@@ -13,7 +13,7 @@ from uuid import uuid4
 
 def make_server(session_path, port, api):
     extra = api.features()
-    Image, _, _, _ = extra.pillow(api.SkillError)
+    Image = extra.pillow(api.SkillError)
     session_path = Path(session_path).expanduser().resolve()
     if not session_path.is_file():
         raise api.SkillError("studio 需要已有的 --session 文件。")
@@ -85,7 +85,7 @@ def make_server(session_path, port, api):
             path, _ = auth
             try:
                 length = int(self.headers.get('Content-Length', '0'))
-                if not 0 < length <= api.MAX_IMAGE_BYTES * 2:
+                if not 0 < length <= api.byte_limit('IMAGE', api.MAX_IMAGE_BYTES) * 2:
                     raise api.SkillError('请求大小无效。')
                 body = json.loads(self.rfile.read(length))
                 if not isinstance(body, dict):
@@ -96,7 +96,7 @@ def make_server(session_path, port, api):
                 elif path == '/api/mask':
                     revision, source = self.revision(int(body['revision']))
                     data = base64.b64decode(body['png'], validate=True)
-                    if len(data) > api.MAX_IMAGE_BYTES:
+                    if len(data) > api.byte_limit('IMAGE', api.MAX_IMAGE_BYTES):
                         raise api.SkillError('蒙版超过大小限制。')
                     with Image.open(io.BytesIO(data)) as mask, Image.open(source) as original:
                         mask.load()

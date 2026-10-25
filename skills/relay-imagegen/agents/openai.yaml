@@ -1,4 +1,4 @@
 interface:
   display_name: "中转站生图"
-  short_description: "配置中转站，支持素材图编辑、视频封面、文案排版及多图生成"
+  short_description: "忠实传递用户需求，由图像模型完成生成、素材编辑、文字和封面排版"
   default_prompt: "使用 $relay-imagegen 生成一张图片：雨夜中的未来城市，电影海报风格。"

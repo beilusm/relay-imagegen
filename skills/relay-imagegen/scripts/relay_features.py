@@ -21,8 +21,8 @@ def read_json(path, error):
 
 def pillow(error):
     try:
-        from PIL import Image, ImageDraw, ImageFont, ImageOps
-        return Image, ImageDraw, ImageFont, ImageOps
+        from PIL import Image
+        return Image
     except ImportError:
         raise error("此本地图片功能需要 Pillow：python3 -m pip install Pillow") from None
 
@@ -33,9 +33,9 @@ def load_mask(path, references, api):
     ref = api.load_reference_images([path])[0]
     if ref["extension"] != "png":
         raise api.SkillError("蒙版必须是含透明通道的 PNG。")
-    if (ref['width'], ref['height']) != (references[0]['width'], references[0]['height']):
+    if 'width' in references[0] and (ref['width'], ref['height']) != (references[0]['width'], references[0]['height']):
         raise api.SkillError("蒙版必须与第一张参考图像素尺寸一致。")
-    Image, _, _, _ = pillow(api.SkillError)
+    Image = pillow(api.SkillError)
     try:
         with Image.open(ref['path']) as im:
             im.load()
@@ -72,21 +72,25 @@ def capability_check(args, config, references, api):
         raise api.SkillError("capabilities 必须是以模型 ID 为键的对象。")
     profile = read_json(args.capabilities, api.SkillError) if args.capabilities else profiles.get(config['model'], {})
     validate_profile(profile, api.SkillError)
+    conflicts = []
     values = {'backends': args.backend, 'sizes': args.size, 'quality': args.quality,
               'background': args.background, 'output_format': args.output_format,
               'input_fidelity': args.input_fidelity, 'moderation': args.moderation,
               'edit_transports': args.edit_transport if references and args.backend == 'images' else None}
     for key, value in values.items():
         if value is not None and key in profile and value not in profile[key]:
-            raise api.SkillError(f"当前模型能力配置不支持 {key}={value}；未提交请求。")
-    for key, requested in [('edit', args.command == 'edit'), ('mask', bool(args.mask)),
+            conflicts.append(f"能力表未列出 {key}={value}")
+    for key, requested in [('edit', args.command == 'edit'), ('mask', bool(args.mask or args.mask_url or args.mask_file_id)),
                            ('stream', args.stream), ('output_compression', args.output_compression is not None)]:
         if requested and profile.get(key) is False:
-            raise api.SkillError(f"当前模型能力配置不支持 {key}；未提交请求。")
-    if args.n > profile.get('max_n', 10) and args.request_mode != 'separate':
-        raise api.SkillError("n 超过模型配置的单次上限；可显式选择 --request-mode separate。")
-    if len(references) > profile.get('max_reference_images', 16):
-        raise api.SkillError("参考图数量超过模型能力配置上限。")
+            conflicts.append(f"能力表标记不支持 {key}")
+    if 'max_n' in profile and min(args.n, 10) > profile['max_n'] and args.request_mode != 'separate':
+        conflicts.append("n 超过能力表的单次上限")
+    if 'max_reference_images' in profile and len(references) > profile['max_reference_images']:
+        conflicts.append("参考图数量超过能力表上限")
+    if conflicts and args.strict_capabilities:
+        raise api.SkillError("；".join(conflicts) + "；已按 --strict-capabilities 停止提交请求。")
+    args.capability_warnings = [{'warning': text + '；能力表仅供参考，按用户参数提交，由服务端判断支持情况。'} for text in conflicts]
     return profile
 
 
@@ -109,40 +113,11 @@ def run_capabilities(args, api):
             raise api.SkillError('capabilities 配置必须是对象。')
         profile = validate_profile(profiles.get(model, {}), api.SkillError)
     return {'ok': True, 'model': model, 'capabilities': profile,
-            'note': '仅为用户维护的能力声明，未探测接口；缺省字段表示未知，不代表支持。'}
+            'note': '用户维护的参考信息，不默认拦截请求；仅 --strict-capabilities 启用拦截。缺省字段表示未知。'}
 
 
 def data_url(ref):
     return 'data:' + ref['mime'] + ';base64,' + base64.b64encode(ref['data']).decode('ascii')
-
-
-def response_payload(parameters, references, mask, args, api):
-    tool = {key: value for key, value in parameters.items() if key not in ('n', 'prompt', 'stream', 'response_format')}
-    tool.update(type='image_generation', action='edit' if args.command == 'edit' else 'generate')
-    if mask:
-        tool['input_image_mask'] = {'image_url': data_url(mask)}
-    content = [{'type': 'input_text', 'text': parameters['prompt']}]
-    content.extend({'type': 'input_image', 'image_url': data_url(ref)} for ref in references)
-    payload = {'model': args.responses_model, 'input': [{'role': 'user', 'content': content}],
-               'tools': [tool], 'tool_choice': {'type': 'image_generation'}, 'store': args.responses_store}
-    if args.previous_response_id:
-        payload['previous_response_id'] = args.previous_response_id
-    if args.stream:
-        payload['stream'] = True
-    return json.dumps(payload, ensure_ascii=False).encode('utf-8'), 'application/json'
-
-
-def normalize_response(payload, api):
-    if not isinstance(payload, dict) or payload.get('status') not in (None, 'completed'):
-        raise api.SkillError("Responses 未完成，未自动重试。")
-    if not isinstance(payload.get('output', []), list):
-        raise api.SkillError('Responses output 必须是数组。')
-    items = []
-    for item in payload.get('output', []):
-        if isinstance(item, dict) and item.get('type') == 'image_generation_call' and item.get('result'):
-            items.append({'b64_json': item['result'], 'revised_prompt': item.get('revised_prompt'),
-                          'usage': item.get('usage'), 'id': item.get('id')})
-    return {'data': items, 'usage': payload.get('usage'), 'response_id': payload.get('id')}
 
 
 def clean_metadata(value, secret):
@@ -158,9 +133,11 @@ def clean_metadata(value, secret):
     return None
 
 
-def stream_request(request, timeout, backend, partial, final, api, expected=1):
+def stream_request(request, timeout, partial, final, api, expected=1):
     """Consume SSE incrementally; save previews/finals before the next network read."""
-    payload = {'data': []}
+    response_limit = api.byte_limit('RESPONSE', api.MAX_JSON_BYTES)
+    payload = {'data': [], 'events': []}
+    event_type = ''
     terminal = False
     total = 0
     try:
@@ -170,12 +147,14 @@ def stream_request(request, timeout, backend, partial, final, api, expected=1):
             lines = []
             event_size = 0
             while True:
-                raw = response.readline(api.MAX_JSON_BYTES + 1)
+                raw = response.readline(response_limit + 1)
                 total += len(raw)
                 event_size += len(raw)
-                if event_size > api.MAX_JSON_BYTES or total > api.MAX_JSON_BYTES * 4:
+                if event_size > response_limit or total > response_limit * 4:
                     raise api.SkillError("流式响应超过本地大小限制。")
                 if raw and raw.strip():
+                    if raw.startswith(b'event:'):
+                        event_type = raw[6:].strip().decode('utf-8')
                     if raw.startswith(b'data:'):
                         lines.append(raw[5:].lstrip().rstrip(b'\r\n'))
                     continue
@@ -191,7 +170,9 @@ def stream_request(request, timeout, backend, partial, final, api, expected=1):
                         raise api.SkillError("流式事件不是有效 JSON。") from None
                     if not isinstance(event, dict):
                         raise api.SkillError("流式事件必须是对象。")
-                    kind = event.get('type', '')
+                    kind = event.get('type') or event_type
+                    event_type = ''
+                    payload['events'].append({key: value for key, value in event.items() if key not in ('b64_json','partial_image_b64')})
                     if not isinstance(kind, str):
                         raise api.SkillError('流式事件 type 必须是字符串。')
                     if kind in ('error', 'response.failed', 'response.incomplete') or kind.endswith('.error'):
@@ -199,15 +180,9 @@ def stream_request(request, timeout, backend, partial, final, api, expected=1):
                     if kind.endswith('.partial_image'):
                         encoded = event.get('partial_image_b64') or event.get('b64_json')
                         if encoded:
-                            partial({'b64_json': encoded})
-                    elif backend == 'responses' and kind == 'response.completed':
-                        payload = normalize_response(event.get('response'), api)
-                        for item in payload['data']:
-                            final(item)
-                        terminal = True
-                        break
-                    elif backend == 'images' and kind in ('image_generation.completed', 'image_edit.completed'):
-                        item = {'b64_json': event.get('b64_json'), 'revised_prompt': event.get('revised_prompt')}
+                            partial(dict(event, b64_json=encoded))
+                    elif kind in ('image_generation.completed', 'image_edit.completed'):
+                        item = dict(event)
                         final(item)
                         payload['data'].append(item)
                         if 'usage' in event:
@@ -221,8 +196,15 @@ def stream_request(request, timeout, backend, partial, final, api, expected=1):
                 raise api.SkillError("流式连接结束但未收到完成事件；预览不是最终图片，未重试。")
     except urllib.error.HTTPError as exc:
         code = exc.code
-        exc.close()
-        raise api.SkillError(f"流式接口返回 HTTP {code}；未自动重试。") from None
+        try:
+            details = json.loads(exc.read(64 * 1024))
+        except (ValueError, UnicodeError, OSError):
+            details = None
+        finally:
+            exc.close()
+        detail = api.safe_error_details(details, request)
+        suffix = f" 参数详情：{detail}" if detail else ""
+        raise api.SkillError(f"流式接口返回 HTTP {code}。{suffix} 未自动重试。") from None
     except (urllib.error.URLError, TimeoutError, OSError):
         raise api.SkillError("流式连接失败或中断；已保存结果保留，未自动重试。") from None
     return payload
@@ -289,21 +271,13 @@ def resolve_parent(args, session, api):
     parent = None
     if args.from_run:
         parent = {'manifest': str(Path(args.from_run).expanduser().resolve()), 'image_index': args.image_index}
-    elif args.command == 'edit' and not args.images and session and session.get('selected') is not None:
+    elif args.command == 'edit' and not (args.images or args.image_urls or args.image_file_ids or args.images_file) and session and session.get('selected') is not None:
         parent = dict(session['revisions'][session['selected']])
     if parent:
         image, run = load_run_image(parent['manifest'], parent['image_index'], api)
         if args.command == 'edit':
             args.images = [image] + (args.images or [])
         args.parent = {k: parent[k] for k in ('manifest', 'image_index')}
-        if args.backend == 'responses' and args.responses_store and not args.previous_response_id:
-            # IDs are server-scoped. Reuse only on the same endpoint and orchestration model.
-            config = api.read_config(api.config_path(args.config))
-            endpoint = api.api_endpoint(args.base_url or config['base_url'], 'responses')
-            if run.get('responses_store') and run.get('endpoint') == endpoint and run.get('responses_model') == args.responses_model:
-                index = next((im.get('request_index') for im in run.get('images', []) if im.get('index') == parent['image_index']), None)
-                entry = next((r for r in run.get('requests', []) if r.get('index') == index), {})
-                args.previous_response_id = entry.get('response_id')
 
 
 def run_with_session(args, api, generate):

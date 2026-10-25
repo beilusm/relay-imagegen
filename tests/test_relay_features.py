@@ -1,4 +1,4 @@
-"""Observable offline protocol, revision, cover and UI behaviors."""
+"""Observable offline protocol, revision, model delegation and UI behaviors."""
 import base64
 from contextlib import contextmanager
 from email.parser import BytesParser
@@ -46,11 +46,15 @@ def advanced_server(mode='images', gate=None):
                 self.send_header('Content-Type', 'text/event-stream')
                 self.end_headers()
                 def event(data):
+                    name=data.get('type','')
+                    if mode=='stream-header':
+                        data=dict(data)
+                        data.pop('type',None)
                     raw = json.dumps(data, ensure_ascii=False).encode()
-                    self.wfile.write(b': keepalive\r\n\r\ndata: '+raw+b'\r\n\r\n')
+                    self.wfile.write(b': keepalive\r\n\r\nevent: '+name.encode()+b'\r\ndata: '+raw+b'\r\n\r\n')
                     self.wfile.flush()
-                prefix = 'response.image_generation_call' if 'responses' in mode else 'image_generation'
-                event({'type': prefix+'.partial_image', 'partial_image_b64': ENCODED, 'b64_json': ENCODED})
+                prefix = 'image_edit' if self.path.endswith('/edits') else 'image_generation'
+                event({'type': prefix+'.partial_image', 'partial_image_b64': ENCODED, 'b64_json': ENCODED,'partial_image_index':0})
                 if gate is not None:
                     gate.wait(timeout=5)
                 if mode == 'stream-drop': return
@@ -68,7 +72,10 @@ def advanced_server(mode='images', gate=None):
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
                 self.end_headers()
-                self.wfile.write(json.dumps(response if mode == 'responses' else {'data': [image], 'usage': {'output_tokens': 5}}).encode())
+                payload={'data':[image],'usage':{'output_tokens':5}}
+                if mode=='metadata':
+                    payload.update(created=123456,background='opaque',output_format='png',quality='max',size='1x1',safety_identifier='anon-test')
+                self.wfile.write(json.dumps(payload).encode())
     server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -108,6 +115,68 @@ class FeatureTests(baseline.RelayTests):
             self.assertEqual(code,0,result)
             self.assertTrue(calls[0]['body']['mask']['image_url'].startswith('data:image/png;base64,'))
 
+    def test_official_json_url_file_id_and_mask_references(self):
+        references=[{'image_url':'https://example.com/reference.png?version=1'},{'file_id':'file-input'}]
+        path=self.root/'references.json'
+        path.write_text(json.dumps(references))
+        with advanced_server() as (base,calls):
+            self.configure(base)
+            code,result=self.edit('--images-file',str(path),'--mask-file-id','file-mask','--safety-identifier','anonymous-test','--user','legacy-test')
+            self.assertEqual(code,0,result)
+            self.assertEqual(calls[0]['path'],'/v1/images/edits')
+            self.assertEqual(calls[0]['body']['images'],references)
+            self.assertEqual(calls[0]['body']['mask'],{'file_id':'file-mask'})
+            self.assertEqual(calls[0]['body']['safety_identifier'],'anonymous-test')
+            self.assertEqual(calls[0]['body']['user'],'legacy-test')
+            self.assertEqual(result['references'],references)
+            self.assertEqual(result['mask'],{'file_id':'file-mask'})
+            self.assertEqual(result['edit_transport'],'json')
+
+    def test_explicit_remote_references_do_not_silently_include_selected_version(self):
+        with advanced_server() as (base,calls):
+            self.configure(base)
+            session=self.root/'session.json'
+            self.assertEqual(self.generate('--session',str(session))[0],0)
+            data_url='data:image/png;base64,'+ENCODED
+            code,result=self.edit('--session',str(session),'--image-url',data_url,'--image-file-id','file-input','--mask-url','https://example.com/mask.png')
+            self.assertEqual(code,0,result)
+            self.assertEqual(calls[1]['body']['images'],[{'image_url':data_url},{'file_id':'file-input'}])
+            self.assertEqual(calls[1]['body']['mask'],{'image_url':'https://example.com/mask.png'})
+            self.assertIsNone(result['parent'])
+            self.assertNotIn(data_url,Path(result['manifest']).read_text())
+
+    def test_remote_reference_validation_happens_before_network(self):
+        with advanced_server() as (base,calls):
+            self.configure(base)
+            path=self.root/'references.json'
+            for values in [[],[{}],[{'image_url':'https://example.com/a.png','file_id':'file-a'}],[{'image_url':'file:///tmp/local.png'}],[{'file_id':''}],[{'file_id':'file-a'}]*17]:
+                path.write_text(json.dumps(values))
+                self.assertEqual(self.edit('--images-file',str(path))[0],1)
+            self.assertEqual(self.edit('--image-url','https://example.com/a.png','--edit-transport','multipart')[0],1)
+            self.assertEqual(calls,[])
+
+    def test_safety_identifier_and_gpt_only_boundary(self):
+        with advanced_server() as (base,calls):
+            self.configure(base)
+            code,result=self.generate('--safety-identifier','anon-123','--user','legacy-id','--quality','max','--size','1536x864')
+            self.assertEqual(code,0,result)
+            self.assertEqual(calls[0]['body']['safety_identifier'],'anon-123')
+            self.assertEqual(calls[0]['body']['quality'],'max')
+            self.assertEqual(self.generate('--safety-identifier','a'*129)[0],1)
+            self.assertEqual(len(calls),1)
+        for args in [('--backend','responses'),('--response-format','url')]:
+            proc=subprocess.run([sys.executable,str(Path(relay.__file__)),'generate','--prompt','test',*args],capture_output=True,text=True,env=self.env,timeout=10)
+            self.assertEqual(proc.returncode,2)
+
+    def test_declared_output_format_mismatch_is_reported_without_transcoding(self):
+        with advanced_server() as (base,calls):
+            self.configure(base)
+            code,result=self.generate('--output-format','webp')
+            self.assertEqual(code,0,result)
+            self.assertEqual(Path(result['files'][0]).suffix,'.png')
+            self.assertEqual(Path(result['files'][0]).read_bytes(),baseline.PNG)
+            self.assertTrue(any('请求格式 webp' in item['warning'] for item in result['warnings']))
+
     def test_invalid_masks_never_submit(self):
         with advanced_server() as (base,calls):
             self.configure(base)
@@ -120,25 +189,92 @@ class FeatureTests(baseline.RelayTests):
     def test_new_option_validation_before_requests(self):
         with advanced_server() as (base,calls):
             self.configure(base)
-            for options in [('--partial-images','2'),('--output-compression','101'),('--output-compression','40'),('--backend','responses'),('--responses-model','reasoner'),('--backend','responses','--responses-model','reasoner','--n','2')]:
+            for options in [('--partial-images','2'),('--output-compression','101'),('--output-compression','40')]:
                 code,result=self.generate(*options)
                 self.assertEqual(code,1,result)
             self.assertEqual(calls,[])
 
-    def test_capability_profile_rejects_unsupported(self):
+    def test_capability_profile_rejects_only_in_explicit_strict_mode(self):
         with advanced_server() as (base,calls):
             self.configure(base)
             profile=self.root/'profile.json'
             profile.write_text(json.dumps({'stream':False,'background':['opaque'],'max_n':1,'backends':['images']}))
             code,result=self.cli('capabilities','set','--file',str(profile))
             self.assertEqual(code,0,result)
-            for opts in [('--stream',),('--background','transparent'),('--n','2'),('--backend','responses','--responses-model','r')]:
-                code,result=self.generate(*opts)
+            for opts in [('--stream',),('--background','transparent'),('--n','2')]:
+                code,result=self.generate('--strict-capabilities',*opts)
                 self.assertEqual(code,1,result)
             self.assertEqual(calls,[])
-            code,result=self.generate('--n','2','--request-mode','separate')
+            code,result=self.generate('--n','2','--request-mode','separate','--strict-capabilities')
             self.assertEqual(code,0,result)
             self.assertEqual(len(calls),2)
+
+    def test_stale_capability_profile_is_advisory_by_default(self):
+        with baseline.server('multi') as (base,calls):
+            self.configure(base)
+            profile=self.root/'profile.json'
+            profile.write_text(json.dumps({'background':['opaque'],'max_n':1}))
+            self.assertEqual(self.cli('capabilities','set','--file',str(profile))[0],0)
+            code,result=self.generate('--background','transparent','--n','2')
+            self.assertEqual(code,0,result)
+            self.assertEqual(len(calls),1)
+            self.assertEqual(calls[0][3]['n'],2)
+            self.assertEqual(calls[0][3]['background'],'transparent')
+            self.assertEqual(len(result['warnings']),2)
+            manifest=json.loads(Path(result['manifest']).read_text())
+            self.assertEqual(manifest['warnings'],result['warnings'])
+
+    def test_edit_is_not_blocked_by_stale_profile(self):
+        with advanced_server() as (base,calls):
+            self.configure(base)
+            profile=self.root/'profile.json'
+            profile.write_text(json.dumps({'edit':False,'max_reference_images':1}))
+            code,result=self.edit('--image',str(self.image()),'--image',str(self.image('second.png')),'--capabilities',str(profile))
+            self.assertEqual(code,0,result)
+            self.assertEqual(calls[0]['path'],'/v1/images/edits')
+            self.assertEqual(len(result['warnings']),2)
+
+    def test_extra_parameters_reach_images_edits_unchanged(self):
+        parameters={'provider_feature':{'enabled':True,'labels':['原样',2]},'provider_seed':123}
+        path=self.root/'params.json'
+        path.write_text(json.dumps(parameters,ensure_ascii=False))
+        for backend,transport in [('images','multipart'),('images','json')]:
+            with self.subTest(backend=backend,transport=transport),advanced_server(backend) as (base,calls):
+                self.configure(base)
+                source=self.image()
+                original=source.read_bytes()
+                args=['--image',str(source),'--api-params-file',str(path),'--edit-transport',transport]
+                code,result=self.edit(*args)
+                self.assertEqual(code,0,result)
+                body=calls[0]['body']
+                sent=body
+                for key,value in parameters.items():
+                    if backend=='images' and transport=='multipart':
+                        self.assertEqual(json.loads(sent[key]),value)
+                    else:
+                        self.assertEqual(sent[key],value)
+                self.assertEqual(Path(result['files'][0]).read_bytes(),baseline.PNG)
+                self.assertEqual(source.read_bytes(),original)
+
+    def test_extra_parameters_cannot_silently_override_request_or_use_nonfinite_numbers(self):
+        with advanced_server() as (base,calls):
+            self.configure(base)
+            for params in [{'prompt':'changed'},{'n':20},{'image':'changed'},{'image[]':'changed'},{'size':'changed'},
+                           {'feature':float('nan')},{'feature':float('inf')},{'field\r\ninjected':'bad'},{'field"':'bad'},[]]:
+                path=self.root/'params.json'
+                path.write_text(json.dumps(params))
+                code,result=self.generate('--api-params-file',str(path))
+                self.assertEqual(code,1,result)
+            self.assertEqual(calls,[])
+
+    def test_standard_option_values_are_not_frozen_to_old_enums(self):
+        with advanced_server() as (base,calls):
+            self.configure(base)
+            code,result=self.edit('--image',str(self.image()),'--input-fidelity','provider-auto','--moderation','provider-default','--background','provider-new')
+            self.assertEqual(code,0,result)
+            self.assertEqual(calls[0]['body']['input_fidelity'],'provider-auto')
+            self.assertEqual(calls[0]['body']['moderation'],'provider-default')
+            self.assertEqual(calls[0]['body']['background'],'provider-new')
 
     def test_images_stream_previews_and_final(self):
         with advanced_server('stream') as (base,calls):
@@ -149,6 +285,24 @@ class FeatureTests(baseline.RelayTests):
             self.assertEqual(result['saved_count'],1)
             self.assertIs(calls[0]['body']['stream'],True)
             self.assertEqual(result['requests'][0]['event_usage'],[{'output_tokens':5}])
+
+    def test_official_response_metadata_and_stream_preview_index_are_retained(self):
+        with advanced_server('metadata') as (base,calls):
+            self.configure(base)
+            code,result=self.generate()
+            self.assertEqual(code,0,result)
+            metadata=result['requests'][0]['response_metadata']
+            self.assertEqual(metadata['created'],123456)
+            self.assertEqual(metadata['quality'],'max')
+            self.assertEqual(metadata['safety_identifier'],'anon-test')
+            self.assertNotIn('data',metadata)
+        with advanced_server('stream-header') as (base,calls):
+            self.configure(base)
+            code,result=self.edit('--image',str(self.image()),'--stream','--partial-images','1')
+            self.assertEqual(code,0,result)
+            self.assertEqual(result['previews'][0]['response_metadata']['partial_image_index'],0)
+            self.assertEqual(result['images'][0]['usage']['output_tokens'],5)
+            self.assertEqual(len(calls),1)
 
     def test_multipart_stream_uses_lowercase_boolean(self):
         with advanced_server('stream') as (base,calls):
@@ -177,33 +331,6 @@ class FeatureTests(baseline.RelayTests):
             self.assertTrue(Path(result['files'][0]).is_file())
             self.assertEqual(len(calls),1)
 
-    def test_responses_normal_and_stream(self):
-        for mode in ['responses','responses-stream']:
-            with self.subTest(mode=mode),advanced_server(mode) as (base,calls):
-                self.configure(base)
-                code,result=self.generate('--backend','responses','--responses-model','orchestrator',*(['--stream'] if 'stream' in mode else []))
-                self.assertEqual(code,0,result)
-                self.assertEqual(calls[0]['path'],'/v1/responses')
-                body=calls[0]['body']
-                self.assertEqual(body['model'],'orchestrator')
-                self.assertEqual(body['tools'][0]['model'],'image2.5')
-                self.assertNotIn('n',body['tools'][0])
-                self.assertFalse(body['store'])
-                self.assertEqual(result['requests'][0]['response_id'],'resp_local')
-                self.assertEqual(result['images'][0]['revised_prompt'],'改写的猫')
-
-    def test_responses_mask_edit(self):
-        with advanced_server('responses') as (base,calls):
-            self.configure(base)
-            code,result=self.edit('--image',str(self.image()),'--mask',str(self.image('m.png',alpha=True)),
-                '--backend','responses','--responses-model','orchestrator','--previous-response-id','resp_parent')
-            self.assertEqual(code,0,result)
-            body=calls[0]['body']
-            self.assertEqual(body['previous_response_id'],'resp_parent')
-            self.assertEqual(body['tools'][0]['action'],'edit')
-            self.assertIn('input_image_mask',body['tools'][0])
-            self.assertEqual(body['input'][0]['content'][1]['type'],'input_image')
-
     def test_session_select_continue_and_undo(self):
         session=self.root/'session.json'
         with advanced_server() as (base,calls):
@@ -224,17 +351,6 @@ class FeatureTests(baseline.RelayTests):
             self.assertEqual(len(result['revisions']),3)
             self.assertEqual(len(calls),3)
 
-    def test_responses_session_reuses_stored_response_only(self):
-        for stored in (False,True):
-            with advanced_server('responses') as (base,calls):
-                self.configure(base)
-                session=self.root/f'session-{stored}.json'
-                opts=['--session',str(session),'--backend','responses','--responses-model','orchestrator']
-                code,result=self.generate(*opts,*(['--responses-store'] if stored else []))
-                self.assertEqual(code,0,result)
-                code,result=self.edit(*opts,'--responses-store')
-                self.assertEqual(code,0,result)
-                self.assertEqual('previous_response_id' in calls[1]['body'],stored)
 
     def test_from_run_and_session_lock(self):
         with advanced_server() as (base,calls):
@@ -249,37 +365,35 @@ class FeatureTests(baseline.RelayTests):
             self.assertEqual(code,1,result)
             self.assertEqual(len(calls),2)
 
-    def test_cover_multisize_and_non_destructive(self):
-        background=self.image(size=(900,600))
-        original=background.read_bytes()
-        logo=self.image('logo.png',(30,30),True)
-        spec={'background':str(background),'sizes':['1280x720','640x360'], 'formats':['png','jpeg','webp'],
-              'texts':[{'text':'猫的周末\n一起去看世界','font_size':78,'height':.5,'shadow':{'dx':2,'dy':3}}],
-              'overlays':[{'image':str(logo),'x':.7,'y':.7,'width':.1,'height':.1}]}
-        path=self.root/'cover.json';path.write_text(json.dumps(spec,ensure_ascii=False))
-        # cover is local and deliberately does not accept credentials/config.
-        result=self.local_command('cover','--spec',str(path),'--output-dir',str(self.root/'covers'))
-        self.assertTrue(result['ok'],result)
-        self.assertEqual(len(result['files']),6)
-        for file in result['files']:
-            with Image.open(file) as im:
-                im.load();self.assertIn(im.size,[(1280,720),(640,360)])
-        self.assertEqual(original,background.read_bytes())
-        self.assertEqual(result['layouts'][0]['texts'][0]['text'],spec['texts'][0]['text'])
+    def test_local_cover_renderer_is_no_longer_an_executable_command(self):
+        output=self.root/'covers'
+        proc=subprocess.run([sys.executable,str(Path(relay.__file__)),'cover','--spec','unused.json','--output-dir',str(output)],
+                            capture_output=True,text=True,env=self.env,timeout=10)
+        self.assertEqual(proc.returncode,2)
+        self.assertFalse(output.exists())
+        self.assertFalse(Path(relay.__file__).with_name('relay_cover.py').exists())
 
     def local_command(self,*args):
         proc=subprocess.run([sys.executable,str(Path(relay.__file__)),*args],capture_output=True,text=True,env=self.env,timeout=15)
         self.assertEqual(proc.stderr,'',proc.stderr)
         return json.loads(proc.stdout)
 
-    def test_cover_rejects_overflow_and_missing_glyph(self):
-        background=self.image(size=(800,600))
-        for layer in [{'text':'超长文字'*100,'height':.01,'font_size':40,'min_font_size':40},
-                      {'text':'中文','font':str(next(Path('/usr/share/fonts').rglob('DejaVuSans.ttf')))}]:
-            path=self.root/'bad-cover.json';path.write_text(json.dumps({'background':str(background),'texts':[layer]}))
-            result=self.local_command('cover','--spec',str(path),'--output-dir',str(self.root/'bad'))
-            self.assertFalse(result['ok'],result)
-            self.assertFalse((self.root/'bad').exists())
+    def test_chinese_title_edit_transmits_exact_prompt_and_original_pixels(self):
+        prompt='只把标题改为“周末计划·第２期”。\n保持原来的文字位置，不增加任何其他文案。'
+        with advanced_server() as (base,calls):
+            self.configure(base)
+            source=self.image()
+            original=source.read_bytes()
+            code,result=self.cli('edit','--image',str(source),'--prompt',prompt,'--output-dir',str(self.root/'out'))
+            self.assertEqual(code,0,result)
+            self.assertEqual(len(calls),1)
+            body=calls[0]['body']
+            self.assertEqual(calls[0]['path'],'/v1/images/edits')
+            self.assertEqual(body['prompt'],prompt)
+            self.assertEqual(body['image'],original)
+            self.assertEqual(Path(result['files'][0]).read_bytes(),baseline.PNG)
+            for option in ['size','quality','input_fidelity','moderation','output_format','background']:
+                self.assertNotIn(option,body)
 
     def test_stream_preview_is_available_before_request_finishes(self):
         gate=threading.Event()

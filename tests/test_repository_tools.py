@@ -77,6 +77,8 @@ class RepositoryTests(unittest.TestCase):
             self.assertEqual(len(names), count)
             self.assertIn('relay-imagegen/scripts/relay_imagegen.py', names)
             self.assertIn('relay-imagegen/assets/studio.html', names)
+            self.assertNotIn('relay-imagegen/scripts/relay_cover.py', names)
+            self.assertNotIn('relay-imagegen/references/covers.md', names)
             self.assertFalse(any('test_' in n or '__pycache__' in n or n.endswith('config.json') for n in names))
             for name in names:
                 source = package_tool.SKILL / Path(name).relative_to('relay-imagegen')

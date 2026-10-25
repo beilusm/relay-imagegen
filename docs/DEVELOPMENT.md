@@ -13,12 +13,11 @@ relay-imagegen/
 │   ├── agents/openai.yaml          # 技能显示信息
 │   ├── scripts/
 │   │   ├── relay_imagegen.py       # CLI、配置、Images 请求、输出记录
-│   │   ├── relay_features.py       # 蒙版、SSE、Responses、能力和版本
-│   │   ├── relay_cover.py          # 本地排版与多尺寸导出
+│   │   ├── relay_features.py       # 蒙版、SSE、能力和版本
 │   │   └── relay_studio.py         # 本地工作台 HTTP 服务
 │   ├── assets/studio.html          # 工作台页面
 │   └── references/                 # 详细功能与操作约束
-├── examples/                       # 无凭据、可复用的提示词和封面配方
+├── examples/                       # 无凭据、可复用的提示词和素材
 ├── tests/                          # 离线行为测试；不随技能分发
 ├── tools/                          # 安装和打包工具
 ├── docs/
@@ -32,7 +31,7 @@ relay-imagegen/
 
 ## 本地环境与测试
 
-支持 Python 3.9+。API 调用只用标准库；蒙版、封面和工作台按需加载 Pillow。测试封面时需要中文字体和 DejaVu Sans；Ubuntu 可安装 `fonts-noto-cjk`、`fonts-dejavu-core`。其他系统可安装相同字体或调整字体测试的夹具。
+支持 Python 3.9+。API 调用只用标准库；蒙版和工作台按需加载 Pillow；生成和编辑不依赖本地字体。
 
 ```bash
 python3 -m venv .venv
@@ -47,20 +46,20 @@ python -m compileall -q skills/relay-imagegen/scripts tools
 测试使用 loopback HTTP 服务和临时文件，不需要真实配置和 API Key，不提交付费请求。沙箱禁止监听本地端口时，网络模拟测试会失败，需要在允许 loopback 的环境运行；不要用真实中转站替代测试服务。
 
 - `test_relay_imagegen.py`：URL、配置、模型查询、单图/批量、失败保留、重定向、参考图传输等。
-- `test_relay_features.py`：蒙版、参数能力、SSE 中间图即时保存、Responses、会话、封面和工作台访问控制。
+- `test_relay_features.py`：蒙版、官方参数、SSE 中间图即时保存、会话、模型原图透传和工作台访问控制。
 - `test_repository_tools.py`：安装拒绝覆盖、备份更新、链接处理、安装包内容和可重复打包。
 
-修改界面后需另做实际浏览器检查：比较版本、选择当前图、涂抹/擦除/撤销、保存与下载蒙版，以及桌面/窄屏显示。HTTP 测试不能替代浏览器视觉检查。修改封面排版后，用 `examples/cover.json` 导出并打开图片检查。
+修改界面后需另做实际浏览器检查：比较版本、选择当前图、涂抹/擦除/撤销、保存与下载蒙版，以及桌面/窄屏显示。HTTP 测试不能替代浏览器视觉检查。
 
 ## 调用与数据流
 
-`relay_imagegen.py` 统一解析 CLI 并以 JSON 输出结果。generate/edit 经会话包装进入生成流程，在请求前完成文件、参数和能力校验，然后写运行清单，提交请求，保存图片并更新清单。异常批次停止后续提交。
+`relay_imagegen.py` 统一解析 CLI 并以 JSON 输出结果。generate/edit 经会话包装进入生成流程，在请求前完成文件与参数校验，能力表默认仅提示，严格模式才拦截，然后写运行清单，提交请求，保存图片并更新清单。异常批次停止后续提交。
 
-- Images：generate 使用 JSON；edit 默认 multipart，显式选择时才发送 JSON Data URL。
-- Responses：顶层主模型与工具图片模型分别配置；不会根据模型名或错误自动切换后端。
+- Images：generate 使用 JSON；本地 edit 默认 multipart，URL/Data URL/file_id 输入使用 JSON。
+- Images API：generate/edit 直接提交 GPT Image 请求；不会根据模型名或错误自动切换协议。
 - SSE：收到预览/最终图片即落盘并更新清单；预览不计入成功图片。断流时保留已保存结果。
 - 工作台：只绑定 `127.0.0.1`，检查 Host/Origin 和随机令牌；不读取密钥、不提交生图。
-- 封面：加载 JSON 配方、校验布局与字体、渲染所有尺寸后导出；不调用网络。
+- 封面与改字：与普通图像任务共用 generate/edit，由模型生成完整图片；不包含本地文字绘制或合成器。
 
 ## 需要保留的行为
 
@@ -71,8 +70,8 @@ python -m compileall -q skills/relay-imagegen/scripts tools
 5. 运行记录保留实际尺寸、请求状态和已保存图片；中断状态不能被当作可安全重发。
 6. mask 以第一张参考图为基准，保持尺寸和透明通道校验。提示模型保留区域不等于像素级保证。
 7. 会话写入使用锁与原子替换；undo 选择父版本，不删除分支或原图。
-8. `store=false` 是 Responses 默认值；只有显式留存且 endpoint/主模型匹配时复用父响应 ID。
-9. 本地输出尺寸和后处理不能声称为服务端原生结果。
+8. 提示词忠实传递，参考图与输出按原字节传输/保存；不本地叠字、合成、裁切或缩放。
+9. 不将能力表当作默认硬限制，遵循官方每请求 10 张输出、16 张输入边界；资源保护可配置。新增 API 字段可透传，不能覆盖提示词、素材或请求数量。
 
 ## 安装与打包
 
@@ -94,7 +93,7 @@ python3 tools/package.py
 ## 提交与发布
 
 - `.gitignore` 排除 output/dist、API 配置、环境文件和 Python 缓存。不要 `git add -f` 绕过配置文件规则。
-- `examples/` 只使用占位服务地址和无凭据文件；示例配方使用相对路径。
+- `examples/` 只使用占位服务地址和无凭据文件；示例素材使用相对路径。
 - 展示截图不要包含真实服务地址、令牌、用户目录、密钥或未授权素材。现有工作台展示图已裁去路径区域。
 - 提交前运行测试、查看 `git status --short` 和差异；安装包通过构建命令生成，适合附到 GitHub Release，不作为源码跟踪。
 - README 只写已实现的用户行为，不把模拟测试通过写成某个服务商已开放功能。
