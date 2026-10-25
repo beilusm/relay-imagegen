@@ -22,7 +22,7 @@ relay-imagegen/
 ├── tools/                          # 安装和打包工具
 ├── docs/
 │   ├── DEVELOPMENT.md              # 本文
-│   └── assets/                     # 已去除本机路径的用户展示图
+│   └── GPT_IMAGE_API_COVERAGE.md    # API 覆盖与实测
 ├── output/                         # 本地输出，Git 忽略
 └── dist/                           # 生成的安装包，Git 忽略
 ```
@@ -94,7 +94,7 @@ python3 tools/package.py
 
 - `.gitignore` 排除 output/dist、API 配置、环境文件和 Python 缓存。不要 `git add -f` 绕过配置文件规则。
 - `examples/` 只使用占位服务地址和无凭据文件；示例素材使用相对路径。
-- 展示截图不要包含真实服务地址、令牌、用户目录、密钥或未授权素材。现有工作台展示图已裁去路径区域。
+- 展示截图不要包含真实服务地址、令牌、用户目录、密钥或未授权素材。
 - 提交前运行测试、查看 `git status --short` 和差异；安装包通过构建命令生成，适合附到 GitHub Release，不作为源码跟踪。
 - README 只写已实现的用户行为，不把模拟测试通过写成某个服务商已开放功能。
 - 真实中转站验收单独记录服务商、模型、参数和结果，明确计费与重试边界；不将配置文件或原始凭据写入报告。
